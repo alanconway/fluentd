@@ -24,6 +24,7 @@ require 'fluent/plugin/parser_multiline'
 require 'fluent/variable_store'
 require 'fluent/capability'
 require 'fluent/plugin/in_tail/position_file'
+require 'fluent/plugin/in_tail/write_watcher'
 
 if Fluent.windows?
   require_relative 'file_wrapper'
@@ -53,6 +54,7 @@ module Fluent::Plugin
       super
       @paths = []
       @tails = {}
+      @write_watcher = WriteWatcher.new(log)
       @pf_file = nil
       @pf = nil
       @ignore_list = []
@@ -355,7 +357,7 @@ module Fluent::Plugin
 
     def setup_watcher(target_info, pe)
       line_buffer_timer_flusher = @multiline_mode ? TailWatcher::LineBufferTimerFlusher.new(log, @multiline_flush_interval, &method(:flush_buffer)) : nil
-      tw = TailWatcher.new(target_info, pe, log, @read_from_head, @follow_inodes, method(:update_watcher), line_buffer_timer_flusher, method(:io_handler))
+      tw = TailWatcher.new(target_info, pe, log, @read_from_head, @follow_inodes, @write_watcher, method(:update_watcher), line_buffer_timer_flusher, method(:io_handler))
 
       if @enable_watch_timer
         tt = TimerTrigger.new(1, log) { tw.on_notify }
@@ -657,7 +659,7 @@ module Fluent::Plugin
     end
 
     class TailWatcher
-      def initialize(target_info, pe, log, read_from_head, follow_inodes, update_watcher, line_buffer_timer_flusher, io_handler_build)
+      def initialize(target_info, pe, log, read_from_head, follow_inodes, write_watcher, update_watcher, line_buffer_timer_flusher, io_handler_build)
         @path = target_info.path
         @ino = target_info.ino
         @pe = pe || MemoryPositionEntry.new
@@ -665,6 +667,7 @@ module Fluent::Plugin
         @follow_inodes = follow_inodes
         @update_watcher = update_watcher
         @log = log
+        @write_watcher = write_watcher
         @rotate_handler = RotateHandler.new(log, &method(:on_rotate))
         @line_buffer_timer_flusher = line_buffer_timer_flusher
         @io_handler = nil
@@ -707,6 +710,7 @@ module Fluent::Plugin
         end
 
         @rotate_handler.on_notify(stat) if @rotate_handler
+        @write_watcher.on_notify(@path, stat)
         @line_buffer_timer_flusher.on_notify(self) if @line_buffer_timer_flusher
         @io_handler.on_notify if @io_handler
       end
@@ -897,7 +901,8 @@ module Fluent::Plugin
               if !io.nil? && @lines.empty?
                 begin
                   while true
-                    @fifo << io.readpartial(8192, @iobuf)
+                    buf = io.readpartial(8192, @iobuf)
+                    @fifo << buf
                     @fifo.read_lines(@lines)
                     if @lines.size >= @read_lines_limit
                       # not to use too much memory in case the file is very large
